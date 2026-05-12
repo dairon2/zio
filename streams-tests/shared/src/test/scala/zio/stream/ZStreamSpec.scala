@@ -607,6 +607,24 @@ object ZStreamSpec extends ZIOBaseSpec {
               _  <- latch.await
               l2 <- ref.get
             } yield assert(l1.toList)(equalTo((1 to 2).toList)) && assert(l2.reverse)(equalTo((1 to 4).toList))
+          },
+          test("does not start more than capacity elements ahead of the consumer") {
+            for {
+              started       <- Ref.make(Vector.empty[Int])
+              consumingHead <- Promise.make[Nothing, Unit]
+              s = ZStream
+                    .fromIterable(1 to 3)
+                    .mapZIO(i => started.update(_ :+ i) *> ZIO.sleep(1.second).as(i))
+                    .buffer(1)
+              fiber <- s
+                         .runForeach(i => consumingHead.succeed(()).when(i == 1) *> ZIO.never)
+                         .fork
+              _        <- TestClock.adjust(1.second)
+              _        <- consumingHead.await
+              _        <- TestClock.adjust(2.seconds)
+              observed <- started.get
+              _        <- fiber.interrupt
+            } yield assert(observed)(equalTo(Vector(1, 2)))
           }
         ),
         suite("bufferChunks")(

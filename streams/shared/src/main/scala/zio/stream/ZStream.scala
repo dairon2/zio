@@ -391,13 +391,30 @@ final class ZStream[-R, +E, +A] private (val channel: ZChannel[R, Any, Any, Any,
    *   Prefer capacities that are powers of 2 for better performance.
    */
   def buffer(capacity: => Int)(implicit trace: Trace): ZStream[R, E, A] = {
-    val queue = self.toQueueOfElements(capacity)
     new ZStream(
       ZChannel.unwrapScoped[R] {
-        queue.map { queue =>
+        val requestedCapacity = capacity
+        for {
+          queue   <- ZIO.acquireRelease(Queue.bounded[Exit[Option[E], A]](requestedCapacity))(_.shutdown)
+          permits <- ZIO.acquireRelease(Queue.bounded[Unit](requestedCapacity))(_.shutdown)
+          _       <- permits.offerAll(Chunk.fill(requestedCapacity)(())).unit
+          pull    <- self.rechunk(1).toPull
+          _ <- {
+                 def produce: ZIO[R, Nothing, Unit] =
+                   permits.take *>
+                     pull.foldCauseZIO(
+                       cause => queue.offer(Exit.failCause(cause)).unit,
+                       chunk =>
+                         if (chunk.isEmpty) permits.offer(()).unit *> produce
+                         else queue.offerAll(chunk.map(Exit.succeed(_))).unit *> produce
+                     )
+
+                 produce.forkScoped
+               }
+        } yield {
           lazy val process: ZChannel[Any, Any, Any, Any, E, Chunk[A], Unit] =
             ZChannel.fromZIO {
-              queue.take
+              queue.take <* permits.offer(()).unit
             }.flatMap { (exit: Exit[Option[E], A]) =>
               exit.foldExit(
                 Cause
